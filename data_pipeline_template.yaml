@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serverless data pipeline - S3 ingestion, Lambda transform to Parquet,
+  scheduled API ingestion via EventBridge, and SNS failure alerts.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique S3 bucket name for raw/processed data 
+    Default : data-pipeline
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive pipeline failure alerts
+    Default: hassankheireddin0@gmail.com
+
+  PandasLayerArn:
+    Type: String
+    Description: >
+      ARN of the AWS SDK for pandas (pandas/pyarrow) Lambda layer for your
+      region and Python runtime. Verify the version number is current
+      before deploying: aws lambda list-layer-versions --layer-name
+      arn:aws:lambda:<region>:336392948345:layer:AWSSDKPandas-Python313
+    Default: arn:aws:lambda:eu-north-1:336392948345:layer:AWSSDKPandas-Python313:16
+
+Conditions:
+  HasPandasLayer: !Not [!Equals [!Ref PandasLayerArn, '']]
+
+Resources:
+
+  # ---------- Storage ----------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------- Alerts ----------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: pipeline-alerts
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---------- Transform Lambda (S3-triggered) ----------
+  TransformFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: transform-function-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AndLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub 'arn:aws:s3:::${BucketName}/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  TransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: transform-raw-data
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt TransformFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 1024
+      Layers: !If [HasPandasLayer, [!Ref PandasLayerArn], !Ref 'AWS::NoValue']
+      Code:
+        ZipFile: |
+          import boto3
+          import pandas as pd
+          import io
+          import logging
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+
+          class DataPipeline:
+              def __init__(self, bucket_name, file_name):
+                  self.bucket_name = bucket_name
+                  self.file_name = file_name
+                  self.s3_client = boto3.client('s3')
+
+              def read_csv_from_s3(self):
+                  response = self.s3_client.get_object(Bucket=self.bucket_name, Key=self.file_name)
+                  data = response['Body'].read()
+                  df = pd.read_csv(io.BytesIO(data))
+                  return df
+
+              def upload_to_s3(self, body, key):
+                  self.s3_client.put_object(Bucket=self.bucket_name, Key=key, Body=body)
+
+              def clean_data(self, df):
+                  df = df.drop_duplicates()
+
+                  df['salary_usd'] = pd.to_numeric(df['salary_usd'], errors='coerce')
+                  df = df.dropna(subset=['salary_usd', 'job_title', 'experience_level'])
+
+                  df['job_title'] = df['job_title'].str.strip().str.title()
+                  df['experience_level'] = df['experience_level'].str.strip().str.title()
+
+                  df['work_mode'] = df['remote_ratio'].map(
+                      lambda x: 'remote' if x == 100 else 'onsite' if x == 0 else 'hybrid'
+                  )
+
+                  columns_to_remove = ['company_size', 'company_location', 'education', 'has_ml_in_title',
+                                        'manages_people', 'team_size', 'certifications_count',
+                                        'uses_ai_tools_daily', 'ai_tools_hours_per_week', 'salary_currency',
+                                        'equity_offered_pct', 'bonus_pct', 'job_satisfaction_score',
+                                        'interviews_to_offer', 'switched_jobs_last_year',
+                                        'upskilling_hours_per_month', 'fears_ai_automation_score']
+                  df = df.drop(columns=[c for c in columns_to_remove if c in df.columns])
+
+                  return df
+
+              def upload_transformed_data(self):
+                  df = self.read_csv_from_s3()
+                  df_cleaned = self.clean_data(df)
+
+                  quality_summary = {
+                      "file": self.file_name,
+                      "rows_in": len(df),
+                      "rows_out": len(df_cleaned),
+                      "rows_dropped": len(df) - len(df_cleaned),
+                      "processed_at": datetime.utcnow().isoformat()
+                  }
+                  logger.info(quality_summary)
+
+                  out_key = self.file_name.replace('raw/', 'processed/').replace('.csv', '.parquet')
+                  out_buffer = io.BytesIO()
+                  df_cleaned.to_parquet(out_buffer, index=False)
+                  self.upload_to_s3(out_buffer.getvalue(), out_key)
+
+                  return quality_summary
+
+
+          def lambda_handler(event, context):
+              try:
+                  record = event["Records"][0]
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = record["s3"]["object"]["key"]
+
+                  logger.info(f"Starting transform for s3://{bucket}/{key}")
+
+                  pipeline = DataPipeline(bucket, key)
+                  result = pipeline.upload_transformed_data()
+
+                  logger.info(f"Finished transform for s3://{bucket}/{key}")
+                  return {
+                      "statusCode": 200,
+                      "body": result
+                  }
+
+              except Exception as e:
+                  logger.error(f"Transform failed for event: {event}. Error: {str(e)}")
+                  raise
+      DeadLetterConfig:
+        TargetArn: !Ref AlertsTopic
+
+  TransformFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${BucketName}'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  TransformFunctionFailureDestination:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref TransformFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 1
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref AlertsTopic
+
+  # Bucket notification wired separately to avoid a circular dependency
+  # between the bucket and the Lambda permission.
+  BucketNotification:
+    Type: Custom::S3BucketNotification
+    DependsOn: TransformFunctionInvokePermission
+    Properties:
+      ServiceToken: !GetAtt BucketNotificationFunction.Arn
+      BucketName: !Ref DataBucket
+      LambdaFunctionArn: !GetAtt TransformFunction.Arn
+      Prefix: raw/
+      Suffix: .csv
+
+  BucketNotificationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3NotificationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutBucketNotification, s3:GetBucketNotification]
+                Resource: !Sub 'arn:aws:s3:::${BucketName}'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  BucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt BucketNotificationFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  props = event['ResourceProperties']
+                  s3 = boto3.client('s3')
+                  if event['RequestType'] in ('Create', 'Update'):
+                      s3.put_bucket_notification_configuration(
+                          Bucket=props['BucketName'],
+                          NotificationConfiguration={
+                              'LambdaFunctionConfigurations': [{
+                                  'LambdaFunctionArn': props['LambdaFunctionArn'],
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {'Key': {'FilterRules': [
+                                      {'Name': 'prefix', 'Value': props['Prefix']},
+                                      {'Name': 'suffix', 'Value': props['Suffix']}
+                                  ]}}
+                              }]
+                          }
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      s3.put_bucket_notification_configuration(
+                          Bucket=props['BucketName'],
+                          NotificationConfiguration={}
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # ---------- Scheduled API ingestion Lambda (EventBridge-triggered) ----------
+  FetchApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: fetch-api-function-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3WriteAndLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub 'arn:aws:s3:::${BucketName}/raw/*'
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: '*'
+
+  FetchApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: fetch-api-data
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt FetchApiFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # TODO: CHANGE THIS - still a placeholder. Replace with real code
+          # that calls your API and writes the result to s3://<bucket>/raw/,
+          # or deploy it separately with:
+          #   aws lambda update-function-code --function-name fetch-api-data --zip-file fileb://fetch_api.zip
+          def lambda_handler(event, context):
+              print("Placeholder - replace with real API fetch + S3 upload code")
+              return {"statusCode": 200}
+      DeadLetterConfig:
+        TargetArn: !Ref AlertsTopic
+
+  FetchApiSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: daily-api-ingestion
+      Description: Triggers the API ingestion Lambda once a day
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FetchApiFunction.Arn
+          Id: FetchApiFunctionTarget
+
+  FetchApiScheduleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FetchApiFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FetchApiSchedule.Arn
+
+Outputs:
+  BucketNameOutput:
+    Value: !Ref DataBucket
+  TransformFunctionArn:
+    Value: !GetAtt TransformFunction.Arn
+  FetchApiFunctionArn:
+    Value: !GetAtt FetchApiFunction.Arn
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
