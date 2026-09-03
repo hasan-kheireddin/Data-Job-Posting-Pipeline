@@ -1,8 +1,8 @@
-# Serverless Data Job Posting Pipeline
+# Data Job Posting Pipeline
 Data Job Posting pipeline is designed to extract job posting data from a public API, transform it, and show the results in a dashboards. It is built using AWS services such as Lambda, S3, EventBridge, Glue, Athena, SNS, and multiple other services. The pipeline is designed to be serverless, meaning that it can scale automatically based on the amount of data being processed, and it does not require any infrastructure management.
 
 # ToolBar
-- [Serverless Data Job Posting Pipeline](#serverless-data-job-posting-pipeline)
+- [ServerlessData Job Posting Pipeline](#serverlessdata-job-posting-pipeline)
 - [ToolBar](#toolbar)
 - [Architecture](#architecture)
   - [Logic Flow](#logic-flow)
